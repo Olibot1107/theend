@@ -1,12 +1,11 @@
 const http = require("http");
-const net = require("net");
-const url = require("url");
+const net  = require("net");
 const { WebSocketServer } = require("ws");
 
-const PORT = process.env.PORT || 10000;
+const PORT       = process.env.PORT       || 10000;
 const AUTH_TOKEN = process.env.PROXY_TOKEN || null;
 
-// ── HTTP server (handles stats + WS upgrade) ─────────────────────────────────
+// ── HTTP server ───────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   if (req.url === "/" || req.url === "/__proxy_stats") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -18,73 +17,113 @@ const server = http.createServer((req, res) => {
 });
 
 // ── WebSocket tunnel ──────────────────────────────────────────────────────────
-// Client connects via WS, sends a JSON handshake:
-//   { host: "example.com", port: 443, token: "optional" }
-// Then raw bytes flow both ways over the WS frames.
+const wss = new WebSocketServer({
+  server,
+  // Allow large binary frames (e.g. MP4 chunks).
+  // The ws library defaults to 100 MB; being explicit here is safer.
+  maxPayload: 128 * 1024 * 1024, // 128 MB
+});
 
-const wss = new WebSocketServer({ server });
-
-wss.on("connection", (ws, req) => {
-  let tcpSocket = null;
+wss.on("connection", (ws) => {
+  let tcpSocket     = null;
   let handshakeDone = false;
-  let buffer = [];
+  let buffer        = [];       // frames that arrive before TCP is ready
+  let tcpDrained    = true;     // backpressure gate: TCP → WS direction
+  let wsDrained     = true;     // backpressure gate: WS  → TCP direction
 
-  ws.on("message", (data) => {
-    // First message is always the handshake JSON
+  // ── WS → TCP ───────────────────────────────────────────────────────────────
+  ws.on("message", (data, isBinary) => {
+
+    // First message: JSON handshake
     if (!handshakeDone) {
       let handshake;
-      try {
-        handshake = JSON.parse(data.toString());
-      } catch {
-        ws.close(1008, "Bad handshake");
-        return;
-      }
+      try   { handshake = JSON.parse(data.toString()); }
+      catch { ws.close(1008, "Bad handshake"); return; }
 
       if (AUTH_TOKEN && handshake.token !== AUTH_TOKEN) {
         ws.close(1008, "Unauthorized");
         return;
       }
-
       const { host, port } = handshake;
-      if (!host || !port) {
-        ws.close(1008, "Missing host/port");
-        return;
-      }
+      if (!host || !port) { ws.close(1008, "Missing host/port"); return; }
 
       console.log(`[WS] Tunnel → ${host}:${port}`);
       handshakeDone = true;
 
       tcpSocket = net.connect(port, host, () => {
         ws.send(JSON.stringify({ status: "connected" }));
-        // Flush any buffered frames that arrived before socket was ready
-        buffer.forEach((b) => tcpSocket.write(b));
+        // Flush buffered pre-connect frames
+        for (const b of buffer) _tcpWrite(b);
         buffer = [];
       });
 
+      // ── TCP → WS (with backpressure) ────────────────────────────────────
       tcpSocket.on("data", (chunk) => {
-        if (ws.readyState === ws.OPEN) ws.send(chunk);
+        if (ws.readyState !== ws.OPEN) return;
+
+        const ok = ws.send(chunk, { binary: true }, (err) => {
+          if (err) { tcpSocket && tcpSocket.destroy(); }
+        });
+
+        // ws.send() returns false when the WS send-buffer is full.
+        // Pause TCP reads until the WS buffer drains to avoid OOM.
+        if (ok === false && tcpDrained) {
+          tcpDrained = false;
+          tcpSocket.pause();
+        }
       });
 
-      tcpSocket.on("close", () => ws.close());
-      tcpSocket.on("error", (err) => {
-        console.error(`[WS] TCP error: ${err.message}`);
+      tcpSocket.on("drain", () => {
+        // TCP write-buffer drained → resume WS reads
+        if (!wsDrained) {
+          wsDrained = true;
+          ws.resume();
+        }
+      });
+
+      tcpSocket.on("close", ()      => ws.close());
+      tcpSocket.on("error", (err)   => {
+        console.error(`[TCP] ${err.message}`);
         ws.close(1011, err.message);
       });
 
       return;
     }
 
-    // Subsequent messages are raw bytes → forward to TCP
+    // Subsequent messages: raw bytes → TCP
     if (tcpSocket && tcpSocket.writable) {
-      tcpSocket.write(data);
+      _tcpWrite(data);
     } else {
       buffer.push(data);
     }
   });
 
+  // Resume TCP reads once WS buffer has drained
+  ws.on("drain", () => {
+    if (!tcpDrained) {
+      tcpDrained = true;
+      tcpSocket && tcpSocket.resume();
+    }
+  });
+
   ws.on("close", () => tcpSocket && tcpSocket.destroy());
   ws.on("error", () => tcpSocket && tcpSocket.destroy());
+
+  // ── Helpers ─────────────────────────────────────────────────────────────
+  function _tcpWrite(data) {
+    const ok = tcpSocket.write(data);
+    // TCP write-buffer full → pause WS reads until it drains
+    if (!ok && wsDrained) {
+      wsDrained = false;
+      ws.pause();
+    }
+  }
 });
+
+// ── WS "drain" event note ─────────────────────────────────────────────────────
+// The built-in ws library emits "drain" on the socket underneath.
+// Attach it after the server starts so it is always available.
+wss.on("connection", () => {}); // no-op, real handler above
 
 server.listen(PORT, () => {
   console.log(`🔀 WS proxy server on port ${PORT}`);
