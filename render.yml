@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: http-proxy
+    runtime: node
+    buildCommand: echo "No build step"
+    startCommand: node index.js
+    envVars:
+      - key: PORT
+        value: "10000"
+      # Uncomment to require auth:
+      # - key: PROXY_TOKEN
+        # value: your-secret-token-here
